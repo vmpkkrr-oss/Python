@@ -1,163 +1,735 @@
-import discord
-from discord.ext import commands
+"""EcoDesafio Plus - bot de Discord, leve e didatico.
+
+Requer: pip install -U discord.py
+Opcional, para conversa com IA real: GEMINI_API_KEY no ambiente.
+Nao coloque tokens nem senhas dentro deste arquivo.
+"""
+
+import asyncio
 import json
-import random
+import math
 import os
+import random
+import time
+import unicodedata
+import urllib.error
+import urllib.request
 from datetime import date
 from pathlib import Path
 
-# Configuracoes do bot
+import discord
+from discord.ext import commands
+
+
+# ================ CONFIGURACAO E DADOS ================
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)
-
-# O arquivo fica na mesma pasta do bot.py
+bot = commands.Bot(
+    command_prefix="$",
+    intents=intents,
+    help_command=None,
+    case_insensitive=True,
+    allowed_mentions=discord.AllowedMentions.none(),
+)
+COR = discord.Color.from_rgb(78, 179, 120)
 ARQUIVO = Path(__file__).with_name("pontos_ecodesafio.json")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+LIMITE_PONTOS_JOGOS = 30  # Evita acumular pontos infinitos num dia
+SESSAO_SEGUNDOS = 12 * 60  # Sessoes de jogos expiram apos inatividade
+MAX_SESSOES = 100
+LIMITE_CONVERSAS = 100
+limite_ia = asyncio.Semaphore(2)
 
-# Carrega os pontos salvos, se ja existirem
 try:
-    with open(ARQUIVO, "r", encoding="utf-8") as arquivo:
-        jogadores = json.load(arquivo)
-except (FileNotFoundError, json.JSONDecodeError):
+    with ARQUIVO.open("r", encoding="utf-8") as f:
+        jogadores = json.load(f)
+    if not isinstance(jogadores, dict):
+        jogadores = {}
+except (OSError, ValueError):
     jogadores = {}
+
+# Apenas os jogos ativos e pequenas conversas ficam na memoria RAM.
+sessoes = {}
+conversas = {}
 
 
 def salvar():
-    with open(ARQUIVO, "w", encoding="utf-8") as arquivo:
-        json.dump(jogadores, arquivo, ensure_ascii=False, indent=2)
+    """Salvamento atomico: preserva os dados anteriores, mesmo apos queda."""
+    temporario = ARQUIVO.with_suffix(".json.tmp")
+    try:
+        with temporario.open("w", encoding="utf-8") as f:
+            json.dump(jogadores, f, ensure_ascii=False, indent=2)
+        os.replace(temporario, ARQUIVO)
+    except OSError as e:
+        print(f"Erro ao salvar pontuacao: {e}")
 
 
 def obter_jogador(usuario):
-    identificador = str(usuario.id)
-    if identificador not in jogadores:
-        jogadores[identificador] = {
-            "nome": usuario.display_name,
-            "pontos": 0,
-            "desafio": None,
-            "ultimo_dia": None,
-        }
-    jogadores[identificador]["nome"] = usuario.display_name
-    return jogadores[identificador]
+    chave = str(usuario.id)
+    dados = jogadores.get(chave)
+    if not isinstance(dados, dict):
+        dados = {}
+        jogadores[chave] = dados
+    dados.setdefault("pontos", 0)
+    dados.setdefault("desafio", None)
+    dados.setdefault("ultimo_dia", None)
+    dados.setdefault("dia_jogos", None)
+    dados.setdefault("pontos_jogos_hoje", 0)
+    dados.setdefault("vitorias", 0)
+    dados["nome"] = usuario.display_name
+    return dados
+
+
+def dar_pontos(usuario, valor):
+    """Credita pontos em jogos, com teto por dia; retorna quanto ganhou."""
+    dados = obter_jogador(usuario)
+    hoje = date.today().isoformat()
+    if dados["dia_jogos"] != hoje:
+        dados["dia_jogos"] = hoje
+        dados["pontos_jogos_hoje"] = 0
+    restante = max(0, LIMITE_PONTOS_JOGOS - dados["pontos_jogos_hoje"])
+    ganho = min(valor, restante)
+    dados["pontos_jogos_hoje"] += ganho
+    dados["pontos"] += ganho
+    dados["vitorias"] += 1
+    salvar()
+    return ganho
+
+
+def chave_sessao(ctx):
+    return (ctx.guild.id if ctx.guild else 0, ctx.author.id)
+
+
+def limpar_sessoes():
+    agora = time.monotonic()
+    for chave, sessao in list(sessoes.items()):
+        if agora - sessao.get("atualizada", agora) > SESSAO_SEGUNDOS:
+            sessoes.pop(chave, None)
+    for chave, registro in list(conversas.items()):
+        if agora - registro.get("atualizada", agora) > 30 * 60:
+            conversas.pop(chave, None)
+
+
+def sessao_atual(ctx, tipo=None):
+    limpar_sessoes()
+    s = sessoes.get(chave_sessao(ctx))
+    if s and (tipo is None or s["tipo"] == tipo):
+        s["atualizada"] = time.monotonic()
+        return s
+    return None
+
+
+def criar_sessao(ctx, dados):
+    limpar_sessoes()
+    chave = chave_sessao(ctx)
+    if len(sessoes) >= MAX_SESSOES and chave not in sessoes:
+        return False
+    dados["atualizada"] = time.monotonic()
+    sessoes[chave] = dados
+    return True
+
+
+def normalizar(texto):
+    texto = unicodedata.normalize("NFKD", texto.lower().strip())
+    return "".join(c for c in texto if not unicodedata.combining(c))
 
 
 DICAS = [
     "Feche a torneira enquanto escova os dentes.",
-    "Evite desperdicar comida e aproveite as sobras quando puder.",
-    "Use uma garrafa reutilizavel em vez de comprar varias descartaveis.",
+    "Evite desperdiçar comida e aproveite as sobras quando puder.",
+    "Use uma garrafa reutilizável sempre que possível.",
     "Apague as luzes quando sair de um ambiente.",
-    "Separe materiais reciclaveis de acordo com a coleta da sua cidade.",
+    "Separe materiais recicláveis conforme a coleta da sua cidade.",
+    "Quando for possível, caminhe ou pedale em trajetos curtos.",
+    "Evite deixar aparelhos ligados sem necessidade.",
 ]
-
 DESAFIOS = [
-    "Apague luzes que nao estao sendo usadas hoje.",
-    "Economize agua durante uma atividade do dia.",
-    "Separe corretamente um material reciclavel.",
-    "Use uma garrafa ou sacola reutilizavel.",
-    "Converse com alguem sobre uma forma de evitar desperdicio.",
+    "Apague luzes que não estão sendo usadas hoje.",
+    "Economize água durante uma atividade do dia.",
+    "Separe corretamente um material reciclável.",
+    "Use uma garrafa ou sacola reutilizável.",
+    "Converse com alguém sobre uma forma de evitar desperdício.",
+]
+MATERIAIS = {
+    "plastico": "Separe embalagens plásticas limpas e confira se a coleta local aceita o material.",
+    "papel": "Separe papel e papelão limpos e secos. Papéis muito engordurados podem não ser aceitos.",
+    "vidro": "Separe potes e garrafas. Proteja cacos e identifique para evitar cortes.",
+    "metal": "Latas e embalagens metálicas podem ir para a coleta seletiva, conforme as regras locais.",
+    "pilha": "Leve pilhas e baterias a pontos de coleta específicos; não descarte no lixo comum.",
+    "eletronico": "Leve eletrônicos a um ecoponto ou ponto de coleta especial.",
+    "organico": "Cascas e restos vegetais podem ir para compostagem, quando possível.",
+}
+PIADAS = [
+    "Por que o computador foi ao médico? Porque estava com um vírus! 😄",
+    "Qual é o animal mais antigo? A zebra, porque é em preto e branco!",
+    "O que o zero disse para o oito? Que cinto bonito!",
+    "Por que o livro de matemática estava triste? Porque tinha muitos problemas!",
 ]
 
-MATERIAIS = {
-    "plastico": "Separe embalagens plasticas limpas e veja se a coleta seletiva da sua cidade as aceita.",
-    "papel": "Separe papel e papelao limpos e secos. Papel muito engordurado geralmente nao e reciclavel.",
-    "vidro": "Separe garrafas e potes de vidro. Se estiver quebrado, proteja e identifique para evitar cortes.",
-    "metal": "Latas e outras embalagens metalicas podem ir para a coleta seletiva, conforme as regras locais.",
-    "pilha": "Leve pilhas e baterias a pontos de coleta especiais. Nao coloque no lixo comum.",
-    "eletronico": "Entregue aparelhos antigos em ecopontos ou locais de coleta de lixo eletronico.",
-    "organico": "Restos de frutas e vegetais podem ser usados na compostagem, quando possivel.",
+
+# ========================= AKINATOR =========================
+# Banco de personagens local: sem internet, sem API, sem custo.
+# Tags ajudam a escolher as perguntas com maior chance de separar personagens.
+PERGUNTAS = {
+    "anime": "Seu personagem aparece em um anime?",
+    "jogo": "Seu personagem aparece principalmente em um videogame?",
+    "dragonball": "Ele aparece em Dragon Ball?",
+    "onepiece": "Ele aparece em One Piece?",
+    "naruto": "Ele aparece em Naruto?",
+    "jujutsu": "Ele aparece em Jujutsu Kaisen?",
+    "demon": "Ele aparece em Demon Slayer?",
+    "principal": "Ele é um dos protagonistas principais?",
+    "vilao": "Ele é um vilão ou antagonista importante?",
+    "saiyajin": "Ele é um Saiyajin?",
+    "pirata": "Ele é um pirata?",
+    "ninja": "Ele é um ninja?",
+    "espada": "Ele costuma lutar usando uma espada?",
+    "poder": "Ele possui poderes sobrenaturais?",
+    "voa": "Ele consegue voar por conta própria?",
+    "cabelo_preto": "Ele costuma ter cabelo preto ou bem escuro?",
+    "cabelo_claro": "Ele tem cabelo naturalmente loiro ou claro?",
+    "cabelo_branco": "Ele tem cabelo branco ou prateado?",
+    "mascara": "Ele costuma esconder o rosto com máscara ou venda?",
+    "roupa_vermelha": "Sua roupa mais conhecida tem bastante vermelho?",
+    "raio": "Ele é famoso por usar raios ou eletricidade?",
+    "fogo": "Ele é conhecido por usar fogo?",
+    "transforma": "Ele possui transformações ou várias formas de poder?",
+    "velocidade": "A supervelocidade é uma característica marcante dele?",
+    "mundo_blocos": "Ele vem de um jogo de blocos?",
 }
 
+# O cadastro pode ser ampliado adicionando uma linha com as tags do personagem.
+CADASTRO = {
+    "Goku": "anime dragonball principal saiyajin poder voa cabelo_preto transforma",
+    "Vegeta": "anime dragonball saiyajin poder voa cabelo_preto transforma",
+    "Gohan": "anime dragonball saiyajin poder voa cabelo_preto transforma",
+    "Freeza": "anime dragonball vilao poder voa transforma",
+    "Piccolo": "anime dragonball poder voa",
+    "Broly": "anime dragonball saiyajin poder voa cabelo_preto transforma",
+    "Naruto": "anime naruto principal ninja poder cabelo_claro transforma",
+    "Sasuke": "anime naruto ninja poder cabelo_preto espada raio",
+    "Kakashi": "anime naruto ninja poder cabelo_branco mascara raio",
+    "Itachi": "anime naruto ninja poder cabelo_preto",
+    "Sakura": "anime naruto ninja poder",
+    "Luffy": "anime onepiece principal pirata poder cabelo_preto transforma",
+    "Zoro": "anime onepiece pirata espada cabelo_claro",
+    "Sanji": "anime onepiece pirata cabelo_claro fogo",
+    "Ace": "anime onepiece pirata poder fogo cabelo_preto",
+    "Shanks": "anime onepiece pirata espada roupa_vermelha",
+    "Nami": "anime onepiece pirata raio",
+    "Gojo": "anime jujutsu poder cabelo_branco mascara",
+    "Sukuna": "anime jujutsu vilao poder",
+    "Yuji Itadori": "anime jujutsu principal poder",
+    "Megumi": "anime jujutsu poder cabelo_preto",
+    "Tanjiro": "anime demon principal espada cabelo_preto poder",
+    "Nezuko": "anime demon poder transforma",
+    "Zenitsu": "anime demon espada cabelo_claro raio poder",
+    "Saitama": "anime principal poder velocidade",
+    "Genos": "anime poder fogo velocidade",
+    "Eren Yeager": "anime principal cabelo_preto transforma",
+    "Levi Ackerman": "anime espada cabelo_preto velocidade",
+    "Ichigo": "anime principal espada poder transforma",
+    "Light Yagami": "anime principal cabelo_preto",
+    "Mario": "jogo principal roupa_vermelha",
+    "Luigi": "jogo principal",
+    "Sonic": "jogo principal velocidade poder",
+    "Shadow": "jogo velocidade poder",
+    "Kratos": "jogo principal espada poder",
+    "Steve (Minecraft)": "jogo principal espada mundo_blocos",
+    "Alex (Minecraft)": "jogo espada mundo_blocos",
+    "Link (Zelda)": "jogo principal espada poder",
+}
+PERSONAGENS = {nome: set(tags.split()) for nome, tags in CADASTRO.items()}
 
+
+def ranking_akinator(respostas):
+    """Pontuacao probabilistica pequena, sem modelo de IA ou dependencia externa."""
+    pesos = []
+    for nome, tags in PERSONAGENS.items():
+        log_p = 0.0
+        for atributo, valor in respostas.items():
+            if valor == "naosei":
+                continue
+            possui = atributo in tags
+            if valor == "talvez":
+                log_p += math.log(0.57 if possui else 0.43)
+            else:
+                combina = possui == (valor == "sim")
+                log_p += math.log(0.88 if combina else 0.12)
+        pesos.append((nome, log_p))
+    maior = max(log_p for _, log_p in pesos)
+    normalizados = [(nome, math.exp(log_p - maior)) for nome, log_p in pesos]
+    soma = sum(peso for _, peso in normalizados)
+    return sorted(((nome, peso / soma) for nome, peso in normalizados), key=lambda x: -x[1])
+
+
+def proxima_pergunta(respostas):
+    ranqueados = ranking_akinator(respostas)
+    candidatas = []
+    for atributo in PERGUNTAS:
+        if atributo in respostas:
+            continue
+        prob = sum(peso for nome, peso in ranqueados if atributo in PERSONAGENS[nome])
+        # Perguntas que dividem as possibilidades proximo de 50/50 ajudam mais.
+        candidatas.append((prob * (1 - prob), atributo))
+    return max(candidatas)[1] if candidatas else None
+
+
+# ====================== OUTROS JOGOS =======================
+QUIZZES = [
+    ("Qual material deve ir para um ponto de coleta especial?", ["Casca de banana", "Pilha", "Papel limpo"], "b"),
+    ("Qual atitude economiza água?", ["Fechar torneira", "Deixar aberta", "Lavar calçada todo dia"], "a"),
+    ("Qual linguagem estamos usando neste bot?", ["Java", "C++", "Python"], "c"),
+    ("Qual é o maior planeta do Sistema Solar?", ["Marte", "Júpiter", "Terra"], "b"),
+    ("O que significa CPU?", ["Unidade Central de Processamento", "Cabo de Pixel", "Código de Usuário"], "a"),
+    ("Qual destes materiais é orgânico?", ["Casca de fruta", "Lata", "Garrafa de vidro"], "a"),
+    ("No Minecraft, qual item você usa para minerar pedra com mais eficiência?", ["Espada", "Picareta", "Arco"], "b"),
+    ("Qual é o resultado de 7 x 8?", ["54", "56", "64"], "b"),
+    ("O que uma árvore absorve na fotossíntese?", ["Dióxido de carbono", "Plástico", "Vidro"], "a"),
+    ("Em Python, qual palavra define uma função?", ["func", "make", "def"], "c"),
+    ("Que oceano banha o litoral brasileiro?", ["Pacífico", "Atlântico", "Índico"], "b"),
+    ("Qual comando mostra o menu deste bot?", ["$ajuda", "$lista", "$start"], "a"),
+    ("Qual planeta é conhecido como planeta vermelho?", ["Vênus", "Saturno", "Marte"], "c"),
+    ("Qual desses hábitos ajuda a diminuir o lixo?", ["Descartáveis sempre", "Usar sacola reutilizável", "Jogar papel na rua"], "b"),
+]
+PALAVRAS_FORCA = [
+    ("RECICLAGEM", "Separar e reaproveitar materiais"),
+    ("PYTHON", "Linguagem usada para programar este bot"),
+    ("DISCORD", "Aplicativo de comunidades e conversa"),
+    ("ENERGIA", "Precisamos economizá-la em casa"),
+    ("PLANETA", "A Terra é um"),
+    ("NATUREZA", "Florestas, rios e animais fazem parte dela"),
+    ("KAMEHAMEHA", "Ataque de energia de Dragon Ball"),
+    ("MINECRAFT", "Jogo famoso por seus blocos"),
+    ("ROBLOX", "Plataforma para criar e jogar experiências"),
+    ("AVENTURA", "Uma jornada cheia de desafios"),
+]
+
+
+def forca_visual(sessao):
+    palavra = sessao["palavra"]
+    letras = sessao["letras"]
+    exibicao = " ".join(c if c in letras else "_" for c in palavra)
+    erradas = ", ".join(sorted(c for c in letras if c not in palavra)) or "nenhuma"
+    return f"`{exibicao}`\n❌ Erros: **{sessao['erros']}/7** | Letras erradas: {erradas}"
+
+
+# ======================= CONVERSAS =========================
+def resposta_basica(texto, usuario):
+    """Modo de conversa simples por regras: funciona mesmo sem chave de IA."""
+    t = normalizar(texto)
+    if any(p in t for p in ("oi", "ola", "bom dia", "boa noite", "boa tarde", "eae")):
+        return f"Oi, {usuario.display_name}! 😄 Quer conversar sobre jogos, Python ou o meio ambiente?"
+    if "seu nome" in t or "quem e voce" in t:
+        return "Eu sou o EcoDesafio Plus! Sou um bot de jogos, dicas e desafios ecológicos. 🤖"
+    if "como voce esta" in t or "tudo bem" in t:
+        return "Tudo tranquilo por aqui! E você, como está?"
+    if "obrigad" in t or "valeu" in t:
+        return "De nada! Se quiser, pode pedir outra dica ou jogar comigo. 😄"
+    if "jogo" in t or "brincar" in t or "divers" in t:
+        return "Bora! Temos `$akinator`, `$quiz`, `$forca`, `$numero` e `$jokenpo pedra`."
+    if "recicl" in t or "lixo" in t:
+        return "Reciclar é importante! Use `$reciclar plastico`, `$reciclar papel` ou `$reciclar vidro`."
+    if "agua" in t or "meio ambiente" in t or "natureza" in t:
+        return random.choice(DICAS) + " 🌱 Use `$desafio` para fazer uma missão!"
+    if "python" in t or "program" in t or "codigo" in t:
+        return "Python é a linguagem deste bot! Com `discord.py`, a gente cria comandos usando `@bot.command()`."
+    if "ajuda" in t or "comando" in t:
+        return "Use `$ajuda` para ver tudo que eu faço. Pode me pedir uma dica, jogar ou tirar dúvidas simples!"
+    if "piada" in t:
+        return random.choice(PIADAS)
+    return (
+        "Ainda não sei responder isso muito bem no modo básico 😅. "
+        "Posso conversar sobre jogos, Python e meio ambiente. "
+        "Para respostas mais inteligentes, ative a opção Gemini no computador."
+    )
+
+
+def pedir_gemini(historico):
+    """Executado em thread; nao bloqueia os outros comandos do bot."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    corpo = {
+        "systemInstruction": {
+            "parts": [{"text": (
+                "Você é EcoDesafio, um bot simpático de Discord em português do Brasil, "
+                "feito para estudantes. Responda de forma clara, amigável, útil e breve. "
+                "Ajude com dúvidas escolares, programação, jogos e sustentabilidade. "
+                "Não finja realizar ações fora do chat. Nunca peça senhas ou tokens. "
+                "Se perguntarem comandos, diga para usar $ajuda. "
+                "Não mande @everyone nem marque cargos ou usuários."
+            )}]
+        },
+        "contents": historico,
+        "generationConfig": {"maxOutputTokens": 400, "temperature": 0.7},
+    }
+    requisicao = urllib.request.Request(
+        url,
+        data=json.dumps(corpo).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+        method="POST",
+    )
+    with urllib.request.urlopen(requisicao, timeout=15) as retorno:
+        resposta = json.load(retorno)
+    partes = resposta.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    texto = "\n".join(p.get("text", "") for p in partes if p.get("text"))
+    if not texto:
+        raise ValueError("A API não retornou texto")
+    return texto[:1700]
+
+
+# ========================= COMANDOS =========================
 @bot.event
 async def on_ready():
-    print(f"EcoDesafio online! Logado como {bot.user}")
-    await bot.change_presence(activity=discord.Game(name="$ajuda | EcoDesafio"))
+    print(f"EcoDesafio Plus online! Logado como {bot.user}")
+    print("IA Gemini habilitada." if GEMINI_API_KEY else "Modo de conversa básico (sem chave Gemini).")
+    await bot.change_presence(activity=discord.Game(name="$ajuda | EcoDesafio Plus"))
+
+
+@bot.command(aliases=["help", "comandos"])
+async def ajuda(ctx):
+    embed = discord.Embed(
+        title="🌱 EcoDesafio Plus — Comandos",
+        description="Diversão, perguntas, IA e desafios! Prefixo: `$`",
+        color=COR,
+    )
+    embed.add_field(name="🤖 Conversa", value="`$conversar oi` • `$modoia` • `$esquecer`", inline=False)
+    embed.add_field(name="🧠 Akinator", value="`$akinator` • `$ak sim` • `$ak nao` • `$ak talvez` • `$ak naosei` • `$ak parar`", inline=False)
+    embed.add_field(name="🎮 Jogos", value="`$quiz` + `$resposta a/b/c`\n`$forca` + `$letra a`\n`$numero` + `$chutar 50`\n`$jokenpo pedra` • `$dado` • `$moeda` • `$piada`", inline=False)
+    embed.add_field(name="♻️ Ecologia", value="`$dica` • `$reciclar plastico` • `$desafio` • `$concluir`", inline=False)
+    embed.add_field(name="⭐ Perfil", value="`$pontos` • `$ranking` • `$perfil` • `$ping`", inline=False)
+    embed.set_footer(text="Jogos e desafios podem dar pontos. Jogos: máximo 30 pontos por dia.")
+    await ctx.send(embed=embed)
 
 
 @bot.command()
-async def ajuda(ctx):
-    texto = (
-        "`$ajuda` - mostra os comandos\n"
-        "`$dica` - recebe uma dica ecologica\n"
-        "`$reciclar plastico` - como descartar um material\n"
-        "`$desafio` - recebe seu desafio\n"
-        "`$concluir` - ganha 10 pontos ao concluir\n"
-        "`$pontos` - mostra seus pontos\n"
-        "`$ranking` - mostra os 5 primeiros\n"
-        "`$ping` - testa o bot"
+@commands.cooldown(1, 5, commands.BucketType.user)
+async def conversar(ctx, *, mensagem: str):
+    mensagem = mensagem.strip()
+    if not mensagem or len(mensagem) > 600:
+        await ctx.send("Escreva uma mensagem de até 600 caracteres. Exemplo: `$conversar Oi, tudo bem?`")
+        return
+    if not GEMINI_API_KEY:
+        await ctx.send("🤖 " + resposta_basica(mensagem, ctx.author))
+        return
+    limpar_sessoes()
+    chave = chave_sessao(ctx)
+    if len(conversas) >= LIMITE_CONVERSAS and chave not in conversas:
+        await ctx.send("Muitas conversas ao mesmo tempo. Tente de novo mais tarde.")
+        return
+    anterior = conversas.get(chave, {}).get("mensagens", [])[-6:]
+    atual = anterior + [{"role": "user", "parts": [{"text": mensagem}]}]
+    async with limite_ia:
+        try:
+            async with ctx.typing():
+                resultado = await asyncio.to_thread(pedir_gemini, atual)
+        except (urllib.error.URLError, TimeoutError, ValueError, IndexError, KeyError) as e:
+            print(f"Falha da IA: {type(e).__name__}")
+            await ctx.send("⚠️ IA online indisponível. Modo básico: " + resposta_basica(mensagem, ctx.author))
+            return
+    conversas[chave] = {
+        "atualizada": time.monotonic(),
+        "mensagens": (atual + [{"role": "model", "parts": [{"text": resultado}]}])[-6:],
+    }
+    await ctx.send("🤖 " + discord.utils.escape_mentions(resultado))
+
+
+@bot.command()
+async def modoia(ctx):
+    if GEMINI_API_KEY:
+        await ctx.send(f"🟢 Conversa com IA Gemini ativada (`{GEMINI_MODEL}`).")
+    else:
+        await ctx.send("🟡 Modo básico ativado. Para IA que responda livremente, configure `GEMINI_API_KEY` no CMD.")
+
+
+@bot.command()
+async def esquecer(ctx):
+    conversas.pop(chave_sessao(ctx), None)
+    await ctx.send("🧹 Apaguei o histórico temporário da nossa conversa.")
+
+
+@bot.command(aliases=["akinar", "adivinhar"])
+@commands.cooldown(1, 5, commands.BucketType.user)
+async def akinator(ctx):
+    dados = {"tipo": "akinator", "respostas": {}, "tentativas": [], "fase": "pergunta"}
+    dados["pergunta"] = proxima_pergunta(dados["respostas"])
+    if not criar_sessao(ctx, dados):
+        await ctx.send("Muitas partidas ativas no momento. Tente daqui a pouco.")
+        return
+    await ctx.send(
+        f"🧠 **Mini Akinator!** Pense em um personagem de anime ou videogame.\n"
+        f"**Pergunta 1/10:** {PERGUNTAS[dados['pergunta']]}\n"
+        "Responda com `$ak sim`, `$ak nao`, `$ak talvez` ou `$ak naosei`."
     )
-    painel = discord.Embed(title="🌱 EcoDesafio — Comandos", description=texto,
-                           color=discord.Color.green())
-    painel.set_footer(text="Aprenda e cuide do meio ambiente!")
-    await ctx.send(embed=painel)
 
 
+@bot.command()
+async def ak(ctx, *, resposta: str = ""):
+    s = sessao_atual(ctx, "akinator")
+    if not s:
+        await ctx.send("Não existe jogo de Akinator ativo. Use `$akinator`!")
+        return
+    r = normalizar(resposta).replace(" ", "")
+    if r in ("parar", "sair", "cancelar"):
+        sessoes.pop(chave_sessao(ctx), None)
+        await ctx.send("Jogo encerrado! 👋")
+        return
+    traducoes = {"sim": "sim", "s": "sim", "nao": "nao", "n": "nao", "talvez": "talvez", "t": "talvez", "naosei": "naosei", "?": "naosei"}
+    r = traducoes.get(r)
+    if r is None:
+        await ctx.send("Responda com `$ak sim`, `$ak nao`, `$ak talvez`, `$ak naosei` ou `$ak parar`.")
+        return
+
+    if s["fase"] == "palpite":
+        if r == "sim":
+            ganho = dar_pontos(ctx.author, 12)
+            sessoes.pop(chave_sessao(ctx), None)
+            await ctx.send(f"🎉 **Acertei!** Você ganhou **{ganho} pontos**. Jogue de novo com `$akinator`!")
+            return
+        if r != "nao":
+            await ctx.send("Meu palpite estava certo? Use `$ak sim` ou `$ak nao`.")
+            return
+        classificados = ranking_akinator(s["respostas"])
+        proximo = next((nome for nome, _ in classificados if nome not in s["tentativas"]), None)
+        if proximo is None or len(s["tentativas"]) >= 4:
+            sessoes.pop(chave_sessao(ctx), None)
+            await ctx.send("😅 Não consegui adivinhar desta vez. Meu banco tem personagens limitados. Tente outro!")
+            return
+        s["tentativas"].append(proximo)
+        await ctx.send(f"🤔 Será que é **{proximo}**? Responda `$ak sim` ou `$ak nao`.")
+        return
+
+    s["respostas"][s["pergunta"]] = r
+    if len(s["respostas"]) >= 10:
+        proximo = ranking_akinator(s["respostas"])[0][0]
+        s["fase"] = "palpite"
+        s["tentativas"] = [proximo]
+        await ctx.send(f"🔮 **Acho que seu personagem é {proximo}!** Acertei? `$ak sim` ou `$ak nao`.")
+        return
+    s["pergunta"] = proxima_pergunta(s["respostas"])
+    if not s["pergunta"]:
+        proximo = ranking_akinator(s["respostas"])[0][0]
+        s["fase"] = "palpite"
+        s["tentativas"] = [proximo]
+        await ctx.send(f"🔮 **Seu personagem é {proximo}?** `$ak sim` ou `$ak nao`.")
+        return
+    await ctx.send(f"🧠 **Pergunta {len(s['respostas']) + 1}/10:** {PERGUNTAS[s['pergunta']]}")
+
+
+@bot.command()
+@commands.cooldown(1, 3, commands.BucketType.user)
+async def quiz(ctx):
+    pergunta, opcoes, certa = random.choice(QUIZZES)
+    if not criar_sessao(ctx, {"tipo": "quiz", "certa": certa}):
+        await ctx.send("Muitas partidas ativas. Tente novamente depois.")
+        return
+    await ctx.send(
+        f"🧩 **Quiz:** {pergunta}\n"
+        + "\n".join(f"**{letra.upper()})** {opcao}" for letra, opcao in zip("abc", opcoes))
+        + "\nResponda com `$resposta a`, `$resposta b` ou `$resposta c`."
+    )
+
+
+@bot.command()
+async def resposta(ctx, opcao: str = ""):
+    s = sessao_atual(ctx, "quiz")
+    if not s:
+        await ctx.send("Não há quiz ativo. Use `$quiz`!")
+        return
+    r = normalizar(opcao)
+    if r not in ("a", "b", "c"):
+        await ctx.send("Use `$resposta a`, `$resposta b` ou `$resposta c`.")
+        return
+    sessoes.pop(chave_sessao(ctx), None)
+    if r == s["certa"]:
+        ganho = dar_pontos(ctx.author, 5)
+        await ctx.send(f"✅ Você acertou! **+{ganho} pontos**. Mais uma? `$quiz`!")
+    else:
+        await ctx.send(f"❌ Não foi dessa vez. Resposta correta: **{s['certa'].upper()}**.")
+
+
+@bot.command()
+@commands.cooldown(1, 3, commands.BucketType.user)
+async def forca(ctx):
+    palavra, dica_palavra = random.choice(PALAVRAS_FORCA)
+    s = {"tipo": "forca", "palavra": palavra, "dica": dica_palavra, "letras": set(), "erros": 0}
+    if not criar_sessao(ctx, s):
+        await ctx.send("Muitas partidas ativas. Tente depois.")
+        return
+    await ctx.send(f"🪢 **Jogo da Forca!** Dica: {dica_palavra}\n{forca_visual(s)}\nUse `$letra a`.")
+
+
+@bot.command()
+async def letra(ctx, letra_escolhida: str = ""):
+    s = sessao_atual(ctx, "forca")
+    if not s:
+        await ctx.send("Nenhuma forca ativa. Use `$forca`!")
+        return
+    letra_normal = normalizar(letra_escolhida).upper()
+    if len(letra_normal) != 1 or letra_normal not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        await ctx.send("Digite apenas uma letra. Exemplo: `$letra a`.")
+        return
+    if letra_normal in s["letras"]:
+        await ctx.send("Você já tentou essa letra!\n" + forca_visual(s))
+        return
+    s["letras"].add(letra_normal)
+    if letra_normal not in s["palavra"]:
+        s["erros"] += 1
+    if set(s["palavra"]).issubset(s["letras"]):
+        sessoes.pop(chave_sessao(ctx), None)
+        ganho = dar_pontos(ctx.author, 8)
+        await ctx.send(f"🎉 Palavra: **{s['palavra']}**! Você ganhou **{ganho} pontos**.")
+    elif s["erros"] >= 7:
+        sessoes.pop(chave_sessao(ctx), None)
+        await ctx.send(f"💀 Acabaram suas chances. A palavra era **{s['palavra']}**.")
+    else:
+        await ctx.send("🪢 " + forca_visual(s))
+
+
+@bot.command()
+@commands.cooldown(1, 3, commands.BucketType.user)
+async def numero(ctx):
+    if not criar_sessao(ctx, {"tipo": "numero", "numero": random.randint(1, 100), "tentativas": 7}):
+        await ctx.send("Muitas partidas ativas. Tente depois.")
+        return
+    await ctx.send("🔢 Pensei em um número de **1 a 100**. Você tem **7 tentativas**. Use `$chutar 50`!")
+
+
+@bot.command()
+async def chutar(ctx, numero_escolhido: int = 0):
+    s = sessao_atual(ctx, "numero")
+    if not s:
+        await ctx.send("Nenhum jogo de número ativo. Use `$numero`!")
+        return
+    if not (1 <= numero_escolhido <= 100):
+        await ctx.send("Escolha um número entre 1 e 100.")
+        return
+    s["tentativas"] -= 1
+    if numero_escolhido == s["numero"]:
+        sessoes.pop(chave_sessao(ctx), None)
+        ganho = dar_pontos(ctx.author, 8)
+        await ctx.send(f"🎉 Acertou! O número era **{s['numero']}**. +{ganho} pontos!")
+    elif s["tentativas"] <= 0:
+        sessoes.pop(chave_sessao(ctx), None)
+        await ctx.send(f"😅 Suas tentativas acabaram! Era **{s['numero']}**.")
+    else:
+        dica_numero = "maior" if numero_escolhido < s["numero"] else "menor"
+        await ctx.send(f"❌ Meu número é **{dica_numero}**. Restam **{s['tentativas']}** tentativas.")
+
+
+@bot.command(aliases=["ppt"])
+@commands.cooldown(1, 3, commands.BucketType.user)
+async def jokenpo(ctx, escolha: str = ""):
+    usuario = normalizar(escolha)
+    if usuario == "tesoura":
+        usuario = "tesoura"
+    if usuario not in ("pedra", "papel", "tesoura"):
+        await ctx.send("Use `$jokenpo pedra`, `$jokenpo papel` ou `$jokenpo tesoura`.")
+        return
+    maquina = random.choice(["pedra", "papel", "tesoura"])
+    if usuario == maquina:
+        texto = "Empate!"
+    elif (usuario, maquina) in {("pedra", "tesoura"), ("papel", "pedra"), ("tesoura", "papel")}:
+        ganho = dar_pontos(ctx.author, 2)
+        texto = f"Você venceu! +{ganho} pontos!"
+    else:
+        texto = "Eu ganhei desta vez!"
+    await ctx.send(f"✊ Você: **{usuario}** | Bot: **{maquina}**\n**{texto}**")
+
+
+@bot.command()
+async def dado(ctx, lados: int = 6):
+    if lados < 2 or lados > 1000:
+        await ctx.send("Escolha entre 2 e 1000 lados.")
+        return
+    await ctx.send(f"🎲 Saiu **{random.randint(1, lados)}**!")
+
+
+@bot.command()
+async def moeda(ctx):
+    await ctx.send(f"🪙 **{random.choice(['Cara', 'Coroa'])}**!")
+
+
+@bot.command()
+async def piada(ctx):
+    await ctx.send("😄 " + random.choice(PIADAS))
+
+
+# ======================= ECOLOGIA ==========================
 @bot.command()
 async def dica(ctx):
-    await ctx.send("💡 Dica: " + random.choice(DICAS))
+    await ctx.send("💡 " + random.choice(DICAS))
 
 
 @bot.command()
-async def reciclar(ctx, material: str = None):
-    if material is None:
-        await ctx.send("♻️ Escolha um material: " + ", ".join(MATERIAIS))
+async def reciclar(ctx, material: str = ""):
+    if not material:
+        await ctx.send("♻️ Materiais disponíveis: " + ", ".join(MATERIAIS))
         return
-    resposta = MATERIAIS.get(material.lower())
-    if resposta is None:
-        await ctx.send("Nao conheco esse material. Use `$reciclar` para ver as opcoes.")
-        return
-    await ctx.send("♻️ " + resposta)
+    informacao = MATERIAIS.get(normalizar(material))
+    await ctx.send("♻️ " + (informacao or "Não conheço esse material. Digite `$reciclar` para ver a lista."))
 
 
 @bot.command()
 async def desafio(ctx):
-    pessoa = obter_jogador(ctx.author)
-    if pessoa["ultimo_dia"] == date.today().isoformat():
-        await ctx.send("✅ Voce ja ganhou pontos hoje! Volte amanha.")
+    dados = obter_jogador(ctx.author)
+    if dados["ultimo_dia"] == date.today().isoformat():
+        await ctx.send("✅ Você já concluiu o desafio de hoje. Volte amanhã!")
         return
-    if not pessoa["desafio"]:
-        pessoa["desafio"] = random.choice(DESAFIOS)
+    if not dados["desafio"]:
+        dados["desafio"] = random.choice(DESAFIOS)
         salvar()
-    await ctx.send(
-        f"🌿 Seu desafio: **{pessoa['desafio']}**\n"
-        "Quando terminar, digite `$concluir` para ganhar 10 pontos."
-    )
+    await ctx.send(f"🌿 Sua missão: **{dados['desafio']}**\nQuando terminar de verdade, use `$concluir` (+10 pontos).")
 
 
 @bot.command()
 async def concluir(ctx):
-    pessoa = obter_jogador(ctx.author)
+    dados = obter_jogador(ctx.author)
     hoje = date.today().isoformat()
-    if pessoa["ultimo_dia"] == hoje:
-        await ctx.send("Voce ja recebeu os pontos de hoje. Volte amanha!")
-        return
-    if not pessoa["desafio"]:
-        await ctx.send("Primeiro use `$desafio` para receber uma tarefa.")
-        return
-    pessoa["pontos"] += 10
-    pessoa["ultimo_dia"] = hoje
-    pessoa["desafio"] = None
-    salvar()
-    await ctx.send(f"🎉 Parabens, {ctx.author.mention}! Voce ganhou 10 pontos. Total: **{pessoa['pontos']}**!")
+    if dados["ultimo_dia"] == hoje:
+        await ctx.send("Você já ganhou os pontos ecológicos hoje!")
+    elif not dados["desafio"]:
+        await ctx.send("Primeiro use `$desafio` para receber uma missão.")
+    else:
+        dados["pontos"] += 10
+        dados["ultimo_dia"] = hoje
+        dados["desafio"] = None
+        salvar()
+        await ctx.send(f"🌱 Missão concluída! +10 pontos. Seu total agora é **{dados['pontos']}**!")
 
 
 @bot.command()
 async def pontos(ctx):
-    pessoa = obter_jogador(ctx.author)
-    await ctx.send(f"⭐ {ctx.author.mention}, voce tem **{pessoa['pontos']} pontos**!")
+    dados = obter_jogador(ctx.author)
+    await ctx.send(f"⭐ **{ctx.author.display_name}**: {dados['pontos']} pontos | {dados['vitorias']} vitórias em jogos.")
 
 
 @bot.command()
 async def ranking(ctx):
-    ordem = sorted(jogadores.values(), key=lambda item: item["pontos"], reverse=True)
-    ordem = [item for item in ordem if item["pontos"] > 0][:5]
-    if not ordem:
-        await ctx.send("🏆 Ainda nao ha pontos! Use `$desafio` para comecar.")
+    ordenados = sorted(
+        (p for p in jogadores.values() if isinstance(p, dict) and int(p.get("pontos", 0)) > 0),
+        key=lambda p: int(p.get("pontos", 0)),
+        reverse=True,
+    )[:5]
+    if not ordenados:
+        await ctx.send("🏆 Ninguém pontuou ainda. Use `$desafio` ou jogue uma partida!")
         return
-    linhas = [f"{posicao}. {discord.utils.escape_markdown(item['nome'])}: {item['pontos']} pontos"
-              for posicao, item in enumerate(ordem, start=1)]
-    painel = discord.Embed(title="🏆 Ranking EcoDesafio", description="\n".join(linhas),
-                           color=discord.Color.gold())
-    await ctx.send(embed=painel)
+    linhas = [
+        f"**{i}.** {discord.utils.escape_markdown(str(p.get('nome', 'Jogador')))} — **{p['pontos']}** pontos"
+        for i, p in enumerate(ordenados, 1)
+    ]
+    await ctx.send(embed=discord.Embed(title="🏆 Ranking EcoDesafio", description="\n".join(linhas), color=COR))
+
+
+@bot.command()
+async def perfil(ctx):
+    dados = obter_jogador(ctx.author)
+    embed = discord.Embed(title=f"👤 Perfil de {ctx.author.display_name}", color=COR)
+    embed.add_field(name="⭐ Pontos", value=str(dados["pontos"]))
+    embed.add_field(name="🎮 Vitórias", value=str(dados["vitorias"]))
+    embed.add_field(name="🌿 Missão", value=dados["desafio"] or "Nenhuma pendente", inline=False)
+    embed.set_thumbnail(url=ctx.author.display_avatar.url)
+    await ctx.send(embed=embed)
 
 
 @bot.command()
@@ -167,15 +739,23 @@ async def ping(ctx):
 
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        await ctx.send("Nao conheco esse comando. Digite `$ajuda`.")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send("Esse valor nao e valido. Confira o comando com `$ajuda`.")
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏳ Espere {error.retry_after:.1f}s para usar este comando novamente.")
+    elif isinstance(error, commands.CommandNotFound):
+        await ctx.send("❓ Comando não encontrado. Digite `$ajuda`.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Faltou alguma informação. Exemplo: `$conversar oi` ou `$jokenpo pedra`.")
+    elif isinstance(error, (commands.BadArgument, commands.TooManyArguments)):
+        await ctx.send("Esse valor não parece válido. Use `$ajuda` para conferir.")
     else:
-        print(f"Erro: {error}")
-        await ctx.send("Ocorreu um erro. Tente novamente.")
+        print(f"Falha de comando: {type(error).__name__}: {error}")
+        await ctx.send("⚠️ Ocorreu um erro. Tente novamente daqui a pouco.")
 
 
-# Por seguranca, nao deixe o token escrito neste arquivo.
-token = os.getenv("DISCORD_BOT_TOKEN") or input("Cole seu NOVO token do bot: ").strip()
-bot.run(token)
+if __name__ == "__main__":
+    token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+    if not token:
+        token = input("Cole seu NOVO token do bot Discord: ").strip()
+    if not token:
+        raise SystemExit("Token vazio. Não foi possível iniciar o bot.")
+    bot.run(token)
