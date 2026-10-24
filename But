@@ -1,0 +1,181 @@
+import discord
+from discord.ext import commands
+import json
+import random
+import os
+from datetime import date
+from pathlib import Path
+
+# Configuracoes do bot
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)
+
+# O arquivo fica na mesma pasta do bot.py
+ARQUIVO = Path(__file__).with_name("pontos_ecodesafio.json")
+
+# Carrega os pontos salvos, se ja existirem
+try:
+    with open(ARQUIVO, "r", encoding="utf-8") as arquivo:
+        jogadores = json.load(arquivo)
+except (FileNotFoundError, json.JSONDecodeError):
+    jogadores = {}
+
+
+def salvar():
+    with open(ARQUIVO, "w", encoding="utf-8") as arquivo:
+        json.dump(jogadores, arquivo, ensure_ascii=False, indent=2)
+
+
+def obter_jogador(usuario):
+    identificador = str(usuario.id)
+    if identificador not in jogadores:
+        jogadores[identificador] = {
+            "nome": usuario.display_name,
+            "pontos": 0,
+            "desafio": None,
+            "ultimo_dia": None,
+        }
+    jogadores[identificador]["nome"] = usuario.display_name
+    return jogadores[identificador]
+
+
+DICAS = [
+    "Feche a torneira enquanto escova os dentes.",
+    "Evite desperdicar comida e aproveite as sobras quando puder.",
+    "Use uma garrafa reutilizavel em vez de comprar varias descartaveis.",
+    "Apague as luzes quando sair de um ambiente.",
+    "Separe materiais reciclaveis de acordo com a coleta da sua cidade.",
+]
+
+DESAFIOS = [
+    "Apague luzes que nao estao sendo usadas hoje.",
+    "Economize agua durante uma atividade do dia.",
+    "Separe corretamente um material reciclavel.",
+    "Use uma garrafa ou sacola reutilizavel.",
+    "Converse com alguem sobre uma forma de evitar desperdicio.",
+]
+
+MATERIAIS = {
+    "plastico": "Separe embalagens plasticas limpas e veja se a coleta seletiva da sua cidade as aceita.",
+    "papel": "Separe papel e papelao limpos e secos. Papel muito engordurado geralmente nao e reciclavel.",
+    "vidro": "Separe garrafas e potes de vidro. Se estiver quebrado, proteja e identifique para evitar cortes.",
+    "metal": "Latas e outras embalagens metalicas podem ir para a coleta seletiva, conforme as regras locais.",
+    "pilha": "Leve pilhas e baterias a pontos de coleta especiais. Nao coloque no lixo comum.",
+    "eletronico": "Entregue aparelhos antigos em ecopontos ou locais de coleta de lixo eletronico.",
+    "organico": "Restos de frutas e vegetais podem ser usados na compostagem, quando possivel.",
+}
+
+
+@bot.event
+async def on_ready():
+    print(f"EcoDesafio online! Logado como {bot.user}")
+    await bot.change_presence(activity=discord.Game(name="$ajuda | EcoDesafio"))
+
+
+@bot.command()
+async def ajuda(ctx):
+    texto = (
+        "`$ajuda` - mostra os comandos\n"
+        "`$dica` - recebe uma dica ecologica\n"
+        "`$reciclar plastico` - como descartar um material\n"
+        "`$desafio` - recebe seu desafio\n"
+        "`$concluir` - ganha 10 pontos ao concluir\n"
+        "`$pontos` - mostra seus pontos\n"
+        "`$ranking` - mostra os 5 primeiros\n"
+        "`$ping` - testa o bot"
+    )
+    painel = discord.Embed(title="🌱 EcoDesafio — Comandos", description=texto,
+                           color=discord.Color.green())
+    painel.set_footer(text="Aprenda e cuide do meio ambiente!")
+    await ctx.send(embed=painel)
+
+
+@bot.command()
+async def dica(ctx):
+    await ctx.send("💡 Dica: " + random.choice(DICAS))
+
+
+@bot.command()
+async def reciclar(ctx, material: str = None):
+    if material is None:
+        await ctx.send("♻️ Escolha um material: " + ", ".join(MATERIAIS))
+        return
+    resposta = MATERIAIS.get(material.lower())
+    if resposta is None:
+        await ctx.send("Nao conheco esse material. Use `$reciclar` para ver as opcoes.")
+        return
+    await ctx.send("♻️ " + resposta)
+
+
+@bot.command()
+async def desafio(ctx):
+    pessoa = obter_jogador(ctx.author)
+    if pessoa["ultimo_dia"] == date.today().isoformat():
+        await ctx.send("✅ Voce ja ganhou pontos hoje! Volte amanha.")
+        return
+    if not pessoa["desafio"]:
+        pessoa["desafio"] = random.choice(DESAFIOS)
+        salvar()
+    await ctx.send(
+        f"🌿 Seu desafio: **{pessoa['desafio']}**\n"
+        "Quando terminar, digite `$concluir` para ganhar 10 pontos."
+    )
+
+
+@bot.command()
+async def concluir(ctx):
+    pessoa = obter_jogador(ctx.author)
+    hoje = date.today().isoformat()
+    if pessoa["ultimo_dia"] == hoje:
+        await ctx.send("Voce ja recebeu os pontos de hoje. Volte amanha!")
+        return
+    if not pessoa["desafio"]:
+        await ctx.send("Primeiro use `$desafio` para receber uma tarefa.")
+        return
+    pessoa["pontos"] += 10
+    pessoa["ultimo_dia"] = hoje
+    pessoa["desafio"] = None
+    salvar()
+    await ctx.send(f"🎉 Parabens, {ctx.author.mention}! Voce ganhou 10 pontos. Total: **{pessoa['pontos']}**!")
+
+
+@bot.command()
+async def pontos(ctx):
+    pessoa = obter_jogador(ctx.author)
+    await ctx.send(f"⭐ {ctx.author.mention}, voce tem **{pessoa['pontos']} pontos**!")
+
+
+@bot.command()
+async def ranking(ctx):
+    ordem = sorted(jogadores.values(), key=lambda item: item["pontos"], reverse=True)
+    ordem = [item for item in ordem if item["pontos"] > 0][:5]
+    if not ordem:
+        await ctx.send("🏆 Ainda nao ha pontos! Use `$desafio` para comecar.")
+        return
+    linhas = [f"{posicao}. {discord.utils.escape_markdown(item['nome'])}: {item['pontos']} pontos"
+              for posicao, item in enumerate(ordem, start=1)]
+    painel = discord.Embed(title="🏆 Ranking EcoDesafio", description="\n".join(linhas),
+                           color=discord.Color.gold())
+    await ctx.send(embed=painel)
+
+
+@bot.command()
+async def ping(ctx):
+    await ctx.send(f"🏓 Pong! {round(bot.latency * 1000)} ms")
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        await ctx.send("Nao conheco esse comando. Digite `$ajuda`.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("Esse valor nao e valido. Confira o comando com `$ajuda`.")
+    else:
+        print(f"Erro: {error}")
+        await ctx.send("Ocorreu um erro. Tente novamente.")
+
+
+# Por seguranca, nao deixe o token escrito neste arquivo.
+token = os.getenv("DISCORD_BOT_TOKEN") or input("Cole seu NOVO token do bot: ").strip()
+bot.run(token)
